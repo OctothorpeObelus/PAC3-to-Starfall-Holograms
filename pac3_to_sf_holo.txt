@@ -131,21 +131,19 @@ end
 --Need to apply clips after we know all of the holograms.
 local function buildHolosFromTableApplyClips(tbl, parent)
     local holos, bodygroups, submats, clips = buildHologramsFromTable(tbl, parent)
-    printTable(clips)
     
     --Apply clips
     for index, clip in pairs(clips) do
         local clipPos, clipAng = worldToLocal(clip.PositionOffset, clip.AngleOffset, clip.Position, clip.Angles)
-        print(clipPos)
         local targetEnt
+        
         for index, holo in pairs(holos) do
-            print(holo.UID)
             if holo.UID == clip.TargetEntityUID then
                 targetEnt = holo
                 break
             end
         end
-        print(targetEnt)
+        
         clip.Parent:setClip(clip.Parent.clipCount + 1, true, clip.Position, clipAng:getForward(), targetEnt)
         clip.Parent.clipCount = clip.Parent.clipCount + 1
         yieldCheck()
