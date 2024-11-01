@@ -1,0 +1,230 @@
+--@name PAC3 to Holo v1.2.0
+--@author Octo
+--@shared
+
+--[[
+    DOCUMENTATION
+
+    TO USE: Include this file within another file and save it to a variable. This is how you will call all functions.
+            See example file for an applied use of this library.
+
+    SHARED:
+        buildHologramsFromTable(Table PAC file table, Entity parent, Function callback)
+        - This generates holograms from an already loaded PAC file as a table
+        - The callback function has one argument that returns a table of all the hologram entities that were created
+    
+    CLIENT:
+        loadPACToTable(String PAC filename)
+        - This takes a PAC3 save file and turns it into a Lua table to be iterated through or modified
+        
+        buildHologramsFromFile(String PAC filename, Entity parent, Function callback)
+        - This generates holograms given a filepath to a PAC3 save file.
+        - The callback function has one argument that returns a table of all the hologram entities that were created
+]]
+
+pacHolo = {}
+
+-- Some functions for checking our quota usage.
+local function checkQ(n)
+    return quotaAverage() < quotaMax()*n
+end
+
+-- Check if we should yield
+local function yieldCheck()
+    if not checkQ(0.95) then
+        coroutine.yield()
+    end
+end
+
+local function buildHologramsFromTable(tbl, parent)
+    parent = parent or chip()
+    local holos = {}
+    local bodygroups = {}
+    local submats = {}
+    local clips = {}
+    
+    for index, part in pairs(tbl) do
+        local className = part["self"].ClassName
+        
+        if className == "model2" or className == "model" then
+            if not hologram.canSpawn() then
+                coroutine.yield()
+            end
+            --Build a new hologram with the found info.
+            local partInfo = part["self"]
+            local newHolo = hologram.create(parent:localToWorld(partInfo.Position), parent:localToWorldAngles(partInfo.Angles + partInfo.AngleOffset), partInfo.Model, partInfo.Scale * partInfo.Size)
+            newHolo:setParent(parent)
+            newHolo:setPos(newHolo:localToWorld(partInfo.PositionOffset))
+            
+            if className == "model2" then
+                newHolo:setColor(Color(partInfo.Color[1] * 255, partInfo.Color[2] * 255, partInfo.Color[3] * 255, partInfo.Alpha * 255))
+            else
+                newHolo:setColor(Color(partInfo.Color[1], partInfo.Color[2], partInfo.Color[3], partInfo.Alpha * 255))
+            end
+            
+            newHolo:setMaterial(partInfo.Material)
+            newHolo:setSkin(partInfo.Skin)
+            newHolo:suppressEngineLighting(partInfo.NoLighting or partInfo.Fullbright or false)
+            newHolo.Name = partInfo.Name
+            newHolo.Notes = partInfo.Notes
+            newHolo.UID = partInfo.UniqueID
+            newHolo.clipCount = 0
+            table.insert(holos, newHolo)
+            
+            --Check for children to recurse into.
+            if #part.children > 0 then
+                yieldCheck()
+                local children, bodygroups, submats, clipsList = buildHologramsFromTable(part.children, newHolo)
+                table.add(holos, children)
+                table.add(clips, clipsList)
+                yieldCheck()
+                
+                --Apply bodygroups
+                for index, bodygroup in pairs(bodygroups) do
+                    newHolo:setBodygroup(newHolo:lookupBodygroup(bodygroup.BodyGroupName), bodygroup.ModelIndex)
+                    yieldCheck()
+                end
+                
+                --Apply submaterials
+                for index, submat in pairs(submats) do
+                    newHolo:setSubMaterial(submat.SubMaterialId - 1, submat.Material)
+                    yieldCheck()
+                end
+            end
+        elseif className == "group" then
+            --Check for children to recurse into.
+            if #part.children > 0 then
+                yieldCheck()
+                local children, bodygroups, submats, clipsList = buildHologramsFromTable(part.children, parent)
+                table.add(holos, children)
+                table.add(clips, clipsList)
+                yieldCheck()
+            end
+        elseif className == "bodygroup" then
+            table.insert(bodygroups, {
+                BodyGroupName = part["self"].BodyGroupName,
+                ModelIndex = part["self"].ModelIndex
+            })
+        elseif className == "submaterial" then
+            table.insert(submats, {
+                SubMaterialId = part["self"].SubMaterialId,
+                Material = part["self"].Material
+            })
+        elseif className == "clip2" then
+            table.insert(clips, {
+                Parent = parent,
+                TargetEntityUID = part["self"].TargetEntityUID,
+                Position = part["self"].Position,
+                PositionOffset = part["self"].PositionOffset,
+                Angles = part["self"].Angles,
+                AngleOffset = part["self"].AngleOffset
+            })
+        end
+        
+        yieldCheck()
+    end
+    
+    return holos, bodygroups, submats, clips
+end
+
+
+--Need to apply clips after we know all of the holograms.
+local function buildHolosFromTableApplyClips(tbl, parent)
+    local holos, bodygroups, submats, clips = buildHologramsFromTable(tbl, parent)
+    printTable(clips)
+    
+    --Apply clips
+    for index, clip in pairs(clips) do
+        local clipPos, clipAng = worldToLocal(clip.PositionOffset, clip.AngleOffset, clip.Position, clip.Angles)
+        print(clipPos)
+        local targetEnt
+        for index, holo in pairs(holos) do
+            print(holo.UID)
+            if holo.UID == clip.TargetEntityUID then
+                targetEnt = holo
+                break
+            end
+        end
+        print(targetEnt)
+        clip.Parent:setClip(clip.Parent.clipCount + 1, true, clip.Position, clipAng:getForward(), targetEnt)
+        clip.Parent.clipCount = clip.Parent.clipCount + 1
+        yieldCheck()
+    end
+    
+    return holos, bodygroups, submats, clips
+end
+
+if CLIENT then
+    --Convert a PAC to a table of holograms using a path relative to the PAC3 folder.
+    --This will ONLY convert MODEL parts.
+    pacHolo.loadPACToTable = function(path)
+        local pacString = file.readInGame("/data/pac3/" .. path .. ".txt")
+
+        -- we create a new env so then any global variables don't edit our old env
+        local env = { Vector = Vector, Angle = Angle, Color = Color }
+        local func, err = loadstring( "return { " .. pacString .. "}", "decodedPac", env )
+        
+        if err then
+            return false, err
+        end
+        return func(), nil
+    end
+    
+    --Create holograms from the PAC file and parent it to the given entity.
+    pacHolo.buildHologramsFromFile = function(path, rootParent, callback)
+        rootParent = rootParent or chip()
+        local pacTable, error = pacHolo.loadPACToTable(path)
+        
+        --If we failed to load the pac, let us know why.
+        if not pacTable and error then
+            throw(error)
+        end
+        
+        --Build holograms from table using a pausable coroutine.
+        local holoBuilder = coroutine.create(buildHolosFromTableApplyClips)
+        hook.add("think", "buildHolosCoroutine", function()
+            -- If the coroutine hasn't died, then we need to start it or resume it.
+            if coroutine.status(holoBuilder) ~= "dead" then
+                -- Make sure we're sufficiently below quota to resume
+                if checkQ(0.8) then
+                    -- r will be nil until the final yield which gives us our primes.
+                    -- This will start / resume the coroutine.
+                    local holoTable = coroutine.resume(holoBuilder, pacTable, rootParent)
+        
+                    -- Therefore we check if it's not nil, and print the highest prime.
+                    if holoTable then
+                        callback(holoTable)
+                        hook.remove("think", "buildHolosCoroutine")
+                    end
+                end
+            end
+        end)
+    end
+end
+
+--Create holograms from the given PAC table and parent it to the given entity.
+pacHolo.buildHologramsFromTable = function(pacTable, rootParent, callback)
+    rootParent = rootParent or chip()
+    
+    --Build holograms from table using a pausable coroutine.
+    local holoBuilder = coroutine.create(buildHolosFromTableApplyClips)
+    hook.add("think", "buildHolosCoroutine", function()
+        -- If the coroutine hasn't died, then we need to start it or resume it.
+        if coroutine.status(holoBuilder) ~= "dead" then
+            -- Make sure we're sufficiently below quota to resume
+            if checkQ(0.8) then
+                -- r will be nil until the final yield which gives us our primes.
+                -- This will start / resume the coroutine.
+                local holoTable = coroutine.resume(holoBuilder, pacTable, rootParent)
+    
+                -- Therefore we check if it's not nil, and print the highest prime.
+                if holoTable then
+                    callback(holoTable)
+                    hook.remove("think", "buildHolosCoroutine")
+                end
+            end
+        end
+    end)
+end
+
+return pacHolo
